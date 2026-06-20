@@ -2,9 +2,8 @@
 
 Bridge OBS Studio scene changes to one or more Neewer 660 Pro RGB panel lights
 over Bluetooth Low Energy (BLE). When you switch scenes in OBS, each light
-applies its predefined colour/brightness profile for that scene. It can also
-take on-demand overrides over HTTP (e.g. from a Stream Deck) without changing the
-OBS scene.
+crossfades to its predefined colour/brightness profile for that scene. It can
+also take on-demand overrides over HTTP (e.g. from a Stream Deck).
 
 ## Requirements
 
@@ -45,7 +44,7 @@ uv run neewer-obs-bridge --discover            # scan BLE, list devices, dump se
 uv run neewer-obs-bridge --list-scenes         # ask OBS for its scene names (✓ = has a profile)
 uv run neewer-obs-bridge --init-scenes         # append default per-light profiles for missing OBS scenes
 uv run neewer-obs-bridge --test-scene "piano"  # send a scene's per-light profiles without OBS
-uv run neewer-obs-bridge --test-light left     # send a bright 5600K test to ONE light (to isolate it)
+uv run neewer-obs-bridge --test-light left     # send a bright test to ONE light (to isolate it)
 uv run neewer-obs-bridge --config path.toml    # use a specific config file
 ```
 
@@ -55,7 +54,7 @@ config and logs a warning for any that don't (those scenes are ignored).
 ## Configuration
 
 All settings live in `config.toml`: OBS connection, BLE characteristic UUID, the
-HTTP control server, the named lights, and the scene map.
+HTTP control server, transitions, the named lights, and the scene map.
 
 ### Lights
 
@@ -72,7 +71,7 @@ On macOS, bleak reports CoreBluetooth UUIDs (stable per Mac), not MAC addresses.
 ### Scenes
 
 Each scene defines a profile **per light**, so the panels can differ in the same
-scene. There are three modes:
+scene. Three modes:
 
 | Mode  | Fields                                     | Use                |
 | ----- | ------------------------------------------ | ------------------ |
@@ -99,16 +98,32 @@ Notes:
 - A light **omitted** from a scene is left untouched (no command sent to it).
 - Scene names with spaces must be quoted in the header:
   `[scenes."Just Chatting".left]`.
-- In `RGB` mode the light is driven by hue/saturation (converted from your RGB);
-  `brightness` sets the level. `temp` is ignored. Vivid colours render best;
-  very desaturated colours look washed out on these panels.
-- Temperature range is 3200–5600 K; values outside are clamped.
+- The bridge always drives the panels in **RGB mode**: `CCT` profiles are
+  converted to their RGB tint at send time, so the lights never pop when moving
+  between white and colour. You can still author scenes in `CCT` for convenience;
+  `temp` 3200 = warm … 5600 = cool. Vivid colours render best; very desaturated
+  colours look washed out on these panels.
+
+### Transitions
+
+Scene changes **crossfade**: the lights morph directly from the old colour to the
+new one (no dip to black). A scene that turns a light `OFF` fades it to black;
+coming from `OFF` fades up from black.
+
+```toml
+[transitions]
+fade = 1.0        # seconds for the whole transition (0 = instant)
+fade_rate = 30    # steps per second (higher = smoother; uses unacknowledged writes)
+fade_curve = 2.0  # brightness easing; >1 puts more steps near black
+```
+
+The Neewer protocol has no native fade, so the bridge steps it over BLE. The
+number of steps ≈ `fade_rate × fade`. If you still see stepping: raise
+`fade_rate` (40–50), lengthen `fade`, or raise `fade_curve`.
 
 ### HTTP control server (Stream Deck / curl overrides)
 
-When enabled, the running bridge listens on localhost for on-demand overrides
-that do **not** change the OBS scene. An override stays until the next OBS scene
-change, which re-applies that scene's profile.
+When enabled, the running bridge listens on localhost for on-demand overrides.
 
 ```toml
 [control]
@@ -127,13 +142,15 @@ Endpoints (all `GET`):
 | `/set?mode=rgb&r=&g=&b=&brightness=` | colour override                      |
 | `/off`                               | turn off                             |
 | add `&light=left` (or `right`)       | target one light; omit to affect all |
+| add `&fade=<seconds>`                | override the transition time         |
 
-Examples:
+Overrides use the configured `fade` by default; add `&fade=0` for an instant
+change, or `&fade=2` for a slow one.
 
 ```sh
-curl "http://127.0.0.1:8765/set?mode=rgb&r=255&g=0&b=0&brightness=100"
-curl "http://127.0.0.1:8765/scene/piano"
-curl "http://127.0.0.1:8765/off?light=left"
+curl "http://127.0.0.1:8765/set?mode=rgb&r=0&g=191&b=255&brightness=80"   # sky blue (with fade)
+curl "http://127.0.0.1:8765/set?mode=rgb&r=255&g=0&b=0&brightness=100&fade=0"  # instant red flash
+curl "http://127.0.0.1:8765/off?light=left&fade=2"                        # slow fade-off of one light
 ```
 
 #### Wiring it to a Stream Deck
@@ -141,30 +158,12 @@ curl "http://127.0.0.1:8765/off?light=left"
 The Stream Deck can't make HTTP requests out of the box. Two ways:
 
 1. **HTTP-request plugin** (cleanest): install "Web Requests" / "HTTP Request"
-   (BarRaider) from the Marketplace, set a button to method **GET** and the URL
-   above.
+   (BarRaider) from the Marketplace, set a button to method **GET** and the URL.
 2. **Run `curl`**: with a command/launcher plugin, run `/usr/bin/curl` with the
    URL as the argument.
 
 For reusable buttons, define extra scenes in the config that aren't bound to OBS
-and point a button at `/scene/<name>` (URL-encode spaces as `%20`):
-
-```toml
-[scenes."Flash Rojo".left]
-mode = "RGB"
-r = 255
-g = 0
-b = 0
-brightness = 100
-[scenes."Flash Rojo".right]
-mode = "RGB"
-r = 255
-g = 0
-b = 0
-brightness = 100
-```
-
-→ button URL: `http://127.0.0.1:8765/scene/Flash%20Rojo`
+and point a button at `/scene/<name>` (URL-encode spaces as `%20`).
 
 ### OBS connection
 
@@ -180,9 +179,10 @@ password = ""   # the WebSocket password from OBS, or "" if auth is disabled
 - **Light connects but doesn't react**: the bridge uses acknowledged writes and
   the verified RGB660 PRO packet format; if one unit still ignores commands, run
   `--test-light <name>` to isolate it, and `--discover` to confirm the write
-  characteristic `69400002-…` is present with `write-without-response`.
+  characteristic `69400002-…` is present with `write`/`write-without-response`.
 - **One of two identical lights fails**: confirm both addresses with `--discover`
   and use `--test-light left` / `--test-light right` to check each maps to a
   different physical panel.
 - **`Connection refused` to OBS**: enable the WebSocket server in OBS and check
   the port/password in `[obs]`.
+```
