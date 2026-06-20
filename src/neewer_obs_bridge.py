@@ -23,6 +23,7 @@ Setup:
 import argparse
 import asyncio
 import logging
+import math
 import re
 import sys
 import threading
@@ -70,6 +71,18 @@ char_uuid = "69400002-B5A3-F393-E0A9-E50E24DCCA99"
 enabled = true
 host = "127.0.0.1"
 port = 8765
+
+# ── Transitions ──────────────────────────────────────────────────────────────
+# Crossfade between scenes: morph directly from the old colour to the new one
+# (no dip to black). OFF targets fade to black; coming from OFF fades up.
+# `fade` = seconds for the whole transition (0 = instant).
+# fade_rate = steps per second (higher = smoother, uses unacknowledged writes).
+# fade_curve = brightness easing (>1 puts more steps near black, where the eye
+# notices stepping most).
+[transitions]
+fade = 0.0
+fade_rate = 30
+fade_curve = 2.0
 
 # ── Lights ───────────────────────────────────────────────────────────────────
 # Give each panel a friendly name → its BLE address (from --discover).
@@ -154,6 +167,11 @@ class Config:
         self.control_enabled: bool = bool(ctrl.get("enabled", False))
         self.control_host: str = ctrl.get("host", "127.0.0.1")
         self.control_port: int = int(ctrl.get("port", 8765))
+        # Scene-change crossfade (seconds; 0 = instant) + smoothness controls.
+        tr = data.get("transitions", {})
+        self.fade: float = float(tr.get("fade", 0.0))
+        self.fade_rate: float = float(tr.get("fade_rate", 30))    # steps per second
+        self.fade_curve: float = float(tr.get("fade_curve", 2.0))  # brightness easing
 
 
 def load_config(path: Path) -> Config:
@@ -199,7 +217,12 @@ def load_config(path: Path) -> Config:
 def commands_for_scene(cfg: Config, scene: str) -> dict[str, list[bytes]]:
     """Return {light_name: [packets]} for the lights defined in a scene."""
     per_light = cfg.scenes.get(scene, {})
-    return {name: profile_to_commands(profile) for name, profile in per_light.items()}
+    return {name: profile_to_commands(to_rgb(p)) for name, p in per_light.items()}
+
+
+def scene_profiles(cfg: Config, scene: str) -> dict[str, dict]:
+    """Return {light_name: profile} (normalised to RGB) for a scene's lights."""
+    return {name: to_rgb(p) for name, p in cfg.scenes.get(scene, {}).items()}
 
 
 # ── Neewer BLE protocol helpers ───────────────────────────────────────────────
@@ -356,6 +379,13 @@ class NeewerLight:
             self._use_response = False
             await self._client.write_gatt_char(self.char_uuid, command, response=False)
 
+    async def send_fast(self, command: bytes) -> None:
+        """Unacknowledged write — for high-rate fade ramps where a dropped
+        intermediate step doesn't matter."""
+        if self._client is None:
+            raise BleakError("not connected")
+        await self._client.write_gatt_char(self.char_uuid, command, response=False)
+
 
 async def connect_with_backoff(
     light: NeewerLight, base: float = 1.0, max_delay: float = 30.0,
@@ -402,6 +432,137 @@ async def deliver(light: NeewerLight, packets: list[bytes], scene: str) -> bool:
             await light.disconnect()
     logging.error("Giving up on '%s' for scene '%s' after retry.", light.name, scene)
     return False
+
+
+def _packet_at(profile: dict, brightness: int) -> bytes:
+    """A single setting packet for a profile at a given brightness (0-100)."""
+    if profile.get("mode", "CCT").upper() == "RGB":
+        return build_rgb_command(profile.get("r", 255), profile.get("g", 255),
+                                 profile.get("b", 255), brightness)
+    return build_cct_command(brightness, profile.get("temp", 5600))
+
+
+def _cct_to_rgb(kelvin: int) -> "tuple[int, int, int]":
+    """Approximate RGB tint for a colour temperature (Tanner Helland)."""
+    t = max(1000, min(40000, kelvin)) / 100.0
+    if t <= 66:
+        r = 255.0
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+    else:
+        r = 329.698727446 * ((t - 60) ** -0.1332047592)
+        g = 288.1221695283 * ((t - 60) ** -0.0755148492)
+    if t >= 66:
+        b = 255.0
+    elif t <= 19:
+        b = 0.0
+    else:
+        b = 138.5177312231 * math.log(t - 10) - 305.0447927307
+    c = lambda x: max(0, min(255, int(round(x))))
+    return c(r), c(g), c(b)
+
+
+def _profile_rgb(profile: dict) -> "tuple[tuple[int, int, int], int]":
+    """A profile's colour as (r,g,b) plus its brightness, for interpolation."""
+    if profile.get("mode", "CCT").upper() == "RGB":
+        rgb = (profile.get("r", 255), profile.get("g", 255), profile.get("b", 255))
+    else:
+        rgb = _cct_to_rgb(profile.get("temp", 5600))
+    return rgb, profile.get("brightness", 80)
+
+
+def to_rgb(profile: dict) -> dict:
+    """Normalise any profile to RGB (CCT → its RGB tint), so the lights stay in
+    RGB mode and never pop between CCT and RGB. OFF passes through unchanged."""
+    mode = profile.get("mode", "CCT").upper()
+    if mode == "OFF":
+        return {"mode": "OFF"}
+    if mode == "RGB":
+        return profile
+    r, g, b = _cct_to_rgb(profile.get("temp", 5600))
+    return {"mode": "RGB", "r": r, "g": g, "b": b,
+            "brightness": profile.get("brightness", 80)}
+
+
+async def _crossfade(light: NeewerLight, from_profile: Optional[dict],
+                     to_profile: dict, fade: float,
+                     rate: float = 30.0, curve: float = 2.0) -> None:
+    """Morph directly from the current colour to the new one (no dip to black).
+
+    OFF targets fade to black; coming from OFF fades up from black. Uses many
+    small unacknowledged steps for smoothness, then a reliable final write.
+    """
+    loop = asyncio.get_running_loop()
+    steps = max(1, round(fade * rate))
+    interval = fade / steps
+
+    async def emit(packet: bytes) -> None:
+        t0 = loop.time()
+        await light.send_fast(packet)
+        await asyncio.sleep(max(0.0, interval - (loop.time() - t0)))
+
+    to_off = to_profile.get("mode", "CCT").upper() == "OFF"
+    from_off = from_profile is None or from_profile.get("mode", "CCT").upper() == "OFF"
+
+    # Target OFF → fade the current colour down to black, then power off.
+    if to_off:
+        if not from_off:
+            (r, g, b), bri = _profile_rgb(from_profile)
+            for s in range(1, steps + 1):
+                await emit(build_rgb_command(r, g, b, round(bri * (1 - s / steps) ** curve)))
+        await light.send(build_power_command(False))
+        return
+
+    # Coming from OFF/unknown → power on and fade the new colour up from black.
+    if from_off:
+        await light.send(build_power_command(True))
+        (r, g, b), bri = _profile_rgb(to_profile)
+        for s in range(1, steps + 1):
+            await emit(build_rgb_command(r, g, b, round(bri * (s / steps) ** curve)))
+        await light.send(_packet_at(to_profile, bri))
+        return
+
+    # Colour → colour. If both are white, interpolate in CCT space (most accurate);
+    # otherwise interpolate directly in RGB space.
+    fm = from_profile.get("mode", "CCT").upper()
+    tm = to_profile.get("mode", "CCT").upper()
+    if fm == "CCT" and tm == "CCT":
+        ft, tt = from_profile.get("temp", 5600), to_profile.get("temp", 5600)
+        fb, tb = from_profile.get("brightness", 80), to_profile.get("brightness", 80)
+        for s in range(1, steps + 1):
+            f = s / steps
+            await emit(build_cct_command(round(fb + (tb - fb) * f), round(ft + (tt - ft) * f)))
+    else:
+        (r0, g0, b0), fb = _profile_rgb(from_profile)
+        (r1, g1, b1), tb = _profile_rgb(to_profile)
+        for s in range(1, steps + 1):
+            f = s / steps
+            await emit(build_rgb_command(round(r0 + (r1 - r0) * f), round(g0 + (g1 - g0) * f),
+                                         round(b0 + (b1 - b0) * f), round(fb + (tb - fb) * f)))
+    # Land exactly on the target with one acknowledged write.
+    await light.send(_packet_at(to_profile, to_profile.get("brightness", 80)))
+
+
+async def transition_light(light: NeewerLight, from_profile: Optional[dict],
+                           to_profile: dict, fade: float, label: str,
+                           rate: float = 30.0, curve: float = 2.0) -> None:
+    """Apply to_profile to a light — crossfading from from_profile when fade>0."""
+    for attempt in range(2):
+        try:
+            if not light.is_connected:
+                await connect_with_backoff(light)
+            if fade and fade > 0:
+                await _crossfade(light, from_profile, to_profile, fade, rate, curve)
+            else:
+                for i, packet in enumerate(profile_to_commands(to_profile)):
+                    if i:
+                        await asyncio.sleep(0.08)
+                    await light.send(packet)
+            logging.info("Applied '%s' to '%s'", label, light.name)
+            return
+        except (BleakError, asyncio.TimeoutError, OSError) as e:
+            logging.warning("Send to '%s' failed (%s); reconnecting.", light.name, e)
+            await light.disconnect()
+    logging.error("Giving up on '%s' for '%s' after retry.", light.name, label)
 
 # ── --discover mode ───────────────────────────────────────────────────────────
 
@@ -598,8 +759,8 @@ async def run_test_light(cfg: Config, light_name: str) -> None:
 
 # ── HTTP control server (Stream Deck / curl overrides) ────────────────────────
 
-def _override_commands(cfg: Config, params: dict) -> "tuple[str, dict[str, list[bytes]]]":
-    """Build a per-light command map from /set query params.
+def _override_profiles(cfg: Config, params: dict) -> "tuple[str, dict[str, dict]]":
+    """Build a per-light profile map from /set query params.
 
     `light` is optional → applies to all lights. mode = cct | rgb | off.
     """
@@ -621,19 +782,19 @@ def _override_commands(cfg: Config, params: dict) -> "tuple[str, dict[str, list[
             "brightness": int(params.get("brightness", 80)),
             "temp": int(params.get("temp", 5600)),
         }
-    packets = profile_to_commands(profile)
+    profile = to_rgb(profile)  # keep everything in RGB mode (no CCT↔RGB pop)
     targets = [light] if light else list(cfg.lights)
-    cmds = {name: packets for name in targets if name in cfg.lights}
-    return f"override:{light or 'all'}:{mode}", cmds
+    profiles = {name: profile for name in targets if name in cfg.lights}
+    return f"override:{light or 'all'}:{mode}", profiles
 
 
 def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
                           queue: "asyncio.Queue") -> type:
     """Build a request handler bound to the running bridge's loop and queue."""
 
-    def enqueue(label: str, cmds: "dict[str, list[bytes]]") -> None:
+    def enqueue(label: str, profiles: "dict[str, dict]", fade: float) -> None:
         # Same thread-safe hand-off the OBS callback uses.
-        loop.call_soon_threadsafe(queue.put_nowait, (label, cmds))
+        loop.call_soon_threadsafe(queue.put_nowait, (label, profiles, fade))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # silence per-request stderr noise
@@ -661,27 +822,29 @@ def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
                         "GET /set?light=&mode=cct&brightness=&temp= white override\n"
                         "GET /set?light=&mode=rgb&r=&g=&b=&brightness= colour override\n"
                         "GET /off[?light=<name>]                    turn off (all or one)\n"
-                        "(omit light= to affect all lights)")
+                        "(omit light= to affect all lights; add &fade=<seconds>, "
+                        "&fade=0 for instant)")
                     return
+                fade = float(params.get("fade", cfg.fade))  # ?fade=0 for instant
                 if parts[0] == "scene" and len(parts) >= 2:
                     name = parts[1]
                     if name not in cfg.scenes:
                         self._reply(404, f"unknown scene '{name}'")
                         return
-                    enqueue(f"http:{name}", commands_for_scene(cfg, name))
+                    enqueue(f"http:{name}", scene_profiles(cfg, name), fade)
                     self._reply(200, f"applied scene '{name}'")
                     return
                 if parts[0] == "set":
-                    label, cmds = _override_commands(cfg, params)
-                    if not cmds:
+                    label, profiles = _override_profiles(cfg, params)
+                    if not profiles:
                         self._reply(400, "no valid light; check the light= name")
                         return
-                    enqueue(label, cmds)
+                    enqueue(label, profiles, fade)
                     self._reply(200, f"applied {label}")
                     return
                 if parts[0] == "off":
-                    label, cmds = _override_commands(cfg, {**params, "mode": "off"})
-                    enqueue(label, cmds)
+                    label, profiles = _override_profiles(cfg, {**params, "mode": "off"})
+                    enqueue(label, profiles, fade)
                     self._reply(200, f"applied {label}")
                     return
                 self._reply(404, "not found; GET / for help")
@@ -716,7 +879,7 @@ class Bridge:
     """
 
     def __init__(self, cfg: Config, loop: asyncio.AbstractEventLoop,
-                 queue: "asyncio.Queue[tuple[str, dict[str, list[bytes]]]]"):
+                 queue: "asyncio.Queue[tuple[str, dict[str, dict], float]]"):
         self._cfg = cfg
         self._loop = loop
         self._queue = queue
@@ -726,32 +889,40 @@ class Bridge:
         # (on_<event_snake_case>), so it must stay exactly this name.
         scene = data.scene_name
         logging.info("Scene changed → %s", scene)
-        cmds = commands_for_scene(self._cfg, scene)
-        if not cmds:
+        profiles = scene_profiles(self._cfg, scene)
+        if not profiles:
             logging.info("No profiles defined for '%s', skipping.", scene)
             return
         # Thread-safe hand-off into the asyncio loop.
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, (scene, cmds))
+        self._loop.call_soon_threadsafe(
+            self._queue.put_nowait, (scene, profiles, self._cfg.fade)
+        )
 
 
 async def _command_worker(
+    cfg: Config,
     lights: dict[str, NeewerLight],
-    queue: "asyncio.Queue[tuple[str, dict[str, list[bytes]]]]",
+    queue: "asyncio.Queue[tuple[str, dict[str, dict], float]]",
 ) -> None:
-    """Serialise scene applications; send to each light concurrently.
+    """Serialise scene applications; transition each light concurrently.
 
-    Coalesces bursts of scene changes to the most recent one (latest wins).
+    Coalesces bursts of scene changes to the most recent one (latest wins), then
+    crossfades each light from its last applied profile to the new one.
     """
+    last_profile: dict[str, dict] = {}  # last applied profile per light
     while True:
-        scene, cmds = await queue.get()
+        label, profiles, fade = await queue.get()
         # Drain any backlog so rapid scene flips only apply the final state.
         while not queue.empty():
-            scene, cmds = queue.get_nowait()
+            label, profiles, fade = queue.get_nowait()
+        targets = [n for n in profiles if n in lights]
         await asyncio.gather(*(
-            deliver(lights[name], packets, scene)
-            for name, packets in cmds.items()
-            if name in lights
+            transition_light(lights[n], last_profile.get(n), profiles[n], fade,
+                             label, cfg.fade_rate, cfg.fade_curve)
+            for n in targets
         ))
+        for n in targets:
+            last_profile[n] = profiles[n]
 
 
 def warn_unconfigured_scenes(cfg: Config) -> None:
@@ -801,8 +972,8 @@ async def run_bridge(cfg: Config) -> None:
         await connect_with_backoff(light, max_attempts=3)
 
     loop = asyncio.get_running_loop()
-    queue: "asyncio.Queue[tuple[str, dict[str, list[bytes]]]]" = asyncio.Queue()
-    worker = asyncio.create_task(_command_worker(lights, queue))
+    queue: "asyncio.Queue[tuple[str, dict[str, dict], float]]" = asyncio.Queue()
+    worker = asyncio.create_task(_command_worker(cfg, lights, queue))
 
     control = start_control_server(cfg, loop, queue) if cfg.control_enabled else None
 
