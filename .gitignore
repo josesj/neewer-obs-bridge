@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+
+# Local config (contains OBS password)
+config.toml
+
+# macOS
+.DS_Store
