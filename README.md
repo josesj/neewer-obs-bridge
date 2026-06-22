@@ -104,6 +104,50 @@ Notes:
   `temp` 3200 = warm … 5600 = cool. Vivid colours render best; very desaturated
   colours look washed out on these panels.
 
+### Reusable light profiles
+
+If the same light look shows up in several scenes, define it once as a named
+**profile** and reference it by name, instead of repeating the values. A profile
+is one light's look in any mode:
+
+```toml
+[profile.studio-key]
+mode = "CCT"
+brightness = 60
+temp = 5600
+
+[profile.studio-fill]
+mode = "CCT"
+brightness = 40
+temp = 5600
+
+[profile.piano-left]
+mode = "RGB"
+r = 240
+g = 240
+b = 240
+brightness = 10
+```
+
+A scene's light is then either an inline table (as above) **or** the name of a
+profile. You can mix both — and reuse the same profile across scenes:
+
+```toml
+[scenes."Starting Soon"]
+left  = "studio-key"         # reference a [profile.*] by name
+right = "studio-fill"
+
+[scenes.piano]
+left = "piano-left"          # reuse the profile here too
+[scenes.piano.right]         # while this light stays inline
+mode = "CCT"
+brightness = 60
+temp = 3200
+```
+
+Profiles are also reachable over HTTP: `GET /profile/<name>` (all lights) or
+`GET /profile/<name>?light=left` (one).
+
 ### Transitions
 
 Scene changes **crossfade**: the lights morph directly from the old colour to the
@@ -138,6 +182,7 @@ Endpoints (all `GET`):
 | ------------------------------------ | ------------------------------------ |
 | `/`                                  | help + list of lights and scenes     |
 | `/scene/<name>`                      | apply a configured scene             |
+| `/profile/<name>`                    | apply a reusable light profile       |
 | `/set?mode=cct&brightness=&temp=`    | white override                       |
 | `/set?mode=rgb&r=&g=&b=&brightness=` | colour override                      |
 | `/off`                               | turn off                             |

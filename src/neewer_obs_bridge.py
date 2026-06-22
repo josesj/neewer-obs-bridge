@@ -91,11 +91,30 @@ fade_curve = 2.0
 left  = "81A6E3DF-4EE3-F30C-8897-BB816C5A9A88"
 right = "71121D85-6258-3148-9D12-3849912016EC"
 
+# ── Reusable light profiles ──────────────────────────────────────────────────
+# A profile is a single light's look (any mode). Define it once with
+# [profile.<name>] and reference it from any scene's light, so you don't repeat
+# the same values everywhere.
+[profile.studio-key]
+mode = "CCT"
+brightness = 60
+temp = 5600
+
+[profile.studio-fill]
+mode = "CCT"
+brightness = 40
+temp = 5600
+
 # ── Scene → per-light profiles ───────────────────────────────────────────────
 # For each scene, define a profile per light: [scenes.<Scene>.<light>]
 # Modes: "CCT" (colour temperature), "RGB" (full colour), "OFF".
 # A light omitted from a scene is left untouched (no command is sent to it).
 # Scene names with spaces must be quoted: [scenes."Just Chatting".left]
+#
+# A light can instead reference a reusable [profile.<name>] by its name:
+#   [scenes."Starting Soon"]
+#   left  = "studio-key"
+#   right = "studio-fill"
 
 [scenes.Gaming.left]
 mode = "RGB"
@@ -127,15 +146,9 @@ temp = 3200
 [scenes.BRB.right]
 mode = "OFF"
 
-[scenes."Starting Soon".left]
-mode = "CCT"
-brightness = 50
-temp = 4500
-
-[scenes."Starting Soon".right]
-mode = "CCT"
-brightness = 50
-temp = 4500
+[scenes."Starting Soon"]
+left  = "studio-key"         # reference reusable [profile.*] by name
+right = "studio-fill"
 
 [scenes.Ending.left]
 mode = "OFF"
@@ -143,6 +156,23 @@ mode = "OFF"
 [scenes.Ending.right]
 mode = "OFF"
 """
+
+
+def _resolve_scene(raw: dict, profiles: "dict[str, dict]") -> "dict[str, dict]":
+    """Resolve a raw scene table into {light: profile}.
+
+    Each light in a scene is either an inline table ([scenes.<Scene>.<light>])
+    or a string naming a reusable [profile.<name>] to reuse across scenes.
+    Unknown profile references are dropped here and reported by validation.
+    """
+    resolved: dict[str, dict] = {}
+    for light, value in raw.items():
+        if isinstance(value, str):  # reference to a named [profile.<name>]
+            if value in profiles:
+                resolved[light] = dict(profiles[value])
+        elif isinstance(value, dict):  # inline per-light profile
+            resolved[light] = dict(value)
+    return resolved
 
 
 class Config:
@@ -160,8 +190,16 @@ class Config:
         )
         # name -> BLE address
         self.lights: dict[str, str] = dict(data.get("lights", {}))
-        # scene name -> {light name -> profile dict}
-        self.scenes: dict[str, dict[str, dict]] = data.get("scenes", {})
+        # Reusable single-light profiles: name -> profile dict. A scene's light
+        # can reference one by name instead of repeating the values inline.
+        self.profiles: dict[str, dict] = data.get("profile", {})
+        # Raw scene tables (a light may be an inline table or a profile name).
+        self._raw_scenes: dict[str, dict] = data.get("scenes", {})
+        # scene name -> {light name -> profile dict}, with references resolved.
+        self.scenes: dict[str, dict[str, dict]] = {
+            name: _resolve_scene(raw, self.profiles)
+            for name, raw in self._raw_scenes.items()
+        }
         # HTTP control server (for Stream Deck etc.)
         ctrl = data.get("control", {})
         self.control_enabled: bool = bool(ctrl.get("enabled", False))
@@ -200,6 +238,18 @@ def load_config(path: Path) -> Config:
     # Note: empty [lights]/[scenes] are allowed here so that bootstrap modes
     # like --init-scenes and --discover can run on a fresh config. Modes that
     # truly need them (the bridge) enforce it themselves.
+
+    # Validate that every scene's profile references exist.
+    for scene, raw in cfg._raw_scenes.items():
+        for light_name, value in raw.items():
+            if isinstance(value, str) and value not in cfg.profiles:
+                print(
+                    f"Scene '{scene}' light '{light_name}' references unknown "
+                    f"profile '{value}'. "
+                    f"Known profiles: {', '.join(cfg.profiles) or '(none)'}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
     # Validate that every scene references only known lights.
     for scene, per_light in cfg.scenes.items():
@@ -817,8 +867,10 @@ def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
                     self._reply(200,
                         "neewer-obs-bridge control\n"
                         f"Lights: {', '.join(cfg.lights)}\n"
-                        f"Scenes: {', '.join(cfg.scenes) or '(none)'}\n\n"
+                        f"Scenes: {', '.join(cfg.scenes) or '(none)'}\n"
+                        f"Profiles: {', '.join(cfg.profiles) or '(none)'}\n\n"
                         "GET /scene/<name>                          apply a configured scene\n"
+                        "GET /profile/<name>[?light=<name>]         apply a reusable light profile\n"
                         "GET /set?light=&mode=cct&brightness=&temp= white override\n"
                         "GET /set?light=&mode=rgb&r=&g=&b=&brightness= colour override\n"
                         "GET /off[?light=<name>]                    turn off (all or one)\n"
@@ -826,6 +878,21 @@ def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
                         "&fade=0 for instant)")
                     return
                 fade = float(params.get("fade", cfg.fade))  # ?fade=0 for instant
+                if parts[0] == "profile" and len(parts) >= 2:
+                    name = parts[1]
+                    if name not in cfg.profiles:
+                        self._reply(404, f"unknown profile '{name}'")
+                        return
+                    profile = to_rgb(cfg.profiles[name])
+                    light = params.get("light")
+                    targets = [light] if light else list(cfg.lights)
+                    profiles = {n: profile for n in targets if n in cfg.lights}
+                    if not profiles:
+                        self._reply(400, "no valid light; check the light= name")
+                        return
+                    enqueue(f"http:profile:{name}", profiles, fade)
+                    self._reply(200, f"applied profile '{name}'")
+                    return
                 if parts[0] == "scene" and len(parts) >= 2:
                     name = parts[1]
                     if name not in cfg.scenes:
