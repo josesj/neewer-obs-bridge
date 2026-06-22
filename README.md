@@ -186,16 +186,23 @@ Endpoints (all `GET`):
 | `/set?mode=cct&brightness=&temp=`    | white override                       |
 | `/set?mode=rgb&r=&g=&b=&brightness=` | colour override                      |
 | `/off`                               | turn off                             |
+| `/resend`                            | re-apply the last state to the lights |
 | add `&light=left` (or `right`)       | target one light; omit to affect all |
 | add `&fade=<seconds>`                | override the transition time         |
 
 Overrides use the configured `fade` by default; add `&fade=0` for an instant
 change, or `&fade=2` for a slow one.
 
+`/resend` replays the last profile each light was set to (scene or override),
+which is handy if a panel dropped its BLE link and reconnected in the wrong
+state. It defaults to **instant** (re-sending power-on too) so the light is
+forced back; add `&fade=` for a soft re-apply, or `&light=` for just one.
+
 ```sh
 curl "http://127.0.0.1:8765/set?mode=rgb&r=0&g=191&b=255&brightness=80"   # sky blue (with fade)
 curl "http://127.0.0.1:8765/set?mode=rgb&r=255&g=0&b=0&brightness=100&fade=0"  # instant red flash
 curl "http://127.0.0.1:8765/off?light=left&fade=2"                        # slow fade-off of one light
+curl "http://127.0.0.1:8765/resend"                                       # re-apply current state to all
 ```
 
 #### Wiring it to a Stream Deck

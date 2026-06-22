@@ -839,8 +839,13 @@ def _override_profiles(cfg: Config, params: dict) -> "tuple[str, dict[str, dict]
 
 
 def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
-                          queue: "asyncio.Queue") -> type:
-    """Build a request handler bound to the running bridge's loop and queue."""
+                          queue: "asyncio.Queue",
+                          last_profile: "dict[str, dict]") -> type:
+    """Build a request handler bound to the running bridge's loop and queue.
+
+    `last_profile` is the worker's shared last-applied-per-light map, used by
+    the /resend endpoint to replay the current state.
+    """
 
     def enqueue(label: str, profiles: "dict[str, dict]", fade: float) -> None:
         # Same thread-safe hand-off the OBS callback uses.
@@ -874,10 +879,25 @@ def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
                         "GET /set?light=&mode=cct&brightness=&temp= white override\n"
                         "GET /set?light=&mode=rgb&r=&g=&b=&brightness= colour override\n"
                         "GET /off[?light=<name>]                    turn off (all or one)\n"
+                        "GET /resend[?light=<name>]                 re-apply the last state\n"
                         "(omit light= to affect all lights; add &fade=<seconds>, "
                         "&fade=0 for instant)")
                     return
                 fade = float(params.get("fade", cfg.fade))  # ?fade=0 for instant
+                if parts[0] == "resend":
+                    # Replay the last-applied profile(s). Default to instant so a
+                    # light that dropped/reset is forced back (power-on included).
+                    light = params.get("light")
+                    snap = {n: dict(p) for n, p in last_profile.items()
+                            if not light or n == light}
+                    if not snap:
+                        self._reply(409, "nothing applied yet"
+                                    if not light else f"no last state for '{light}'")
+                        return
+                    resend_fade = float(params.get("fade", 0.0))
+                    enqueue("resend", snap, resend_fade)
+                    self._reply(200, f"resent {', '.join(snap)}")
+                    return
                 if parts[0] == "profile" and len(parts) >= 2:
                     name = parts[1]
                     if name not in cfg.profiles:
@@ -922,8 +942,9 @@ def _make_control_handler(cfg: Config, loop: asyncio.AbstractEventLoop,
 
 
 def start_control_server(cfg: Config, loop: asyncio.AbstractEventLoop,
-                         queue: "asyncio.Queue") -> Optional[ThreadingHTTPServer]:
-    handler = _make_control_handler(cfg, loop, queue)
+                         queue: "asyncio.Queue",
+                         last_profile: "dict[str, dict]") -> Optional[ThreadingHTTPServer]:
+    handler = _make_control_handler(cfg, loop, queue, last_profile)
     try:
         httpd = ThreadingHTTPServer((cfg.control_host, cfg.control_port), handler)
     except OSError as e:
@@ -970,13 +991,15 @@ async def _command_worker(
     cfg: Config,
     lights: dict[str, NeewerLight],
     queue: "asyncio.Queue[tuple[str, dict[str, dict], float]]",
+    last_profile: "dict[str, dict]",
 ) -> None:
     """Serialise scene applications; transition each light concurrently.
 
     Coalesces bursts of scene changes to the most recent one (latest wins), then
     crossfades each light from its last applied profile to the new one.
+    `last_profile` (last applied profile per light) is shared so the control
+    server can resend the current state on demand.
     """
-    last_profile: dict[str, dict] = {}  # last applied profile per light
     while True:
         label, profiles, fade = await queue.get()
         # Drain any backlog so rapid scene flips only apply the final state.
@@ -1040,9 +1063,14 @@ async def run_bridge(cfg: Config) -> None:
 
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue[tuple[str, dict[str, dict], float]]" = asyncio.Queue()
-    worker = asyncio.create_task(_command_worker(cfg, lights, queue))
+    # Shared last-applied profile per light, so /resend can replay it.
+    last_profile: dict[str, dict] = {}
+    worker = asyncio.create_task(_command_worker(cfg, lights, queue, last_profile))
 
-    control = start_control_server(cfg, loop, queue) if cfg.control_enabled else None
+    control = (
+        start_control_server(cfg, loop, queue, last_profile)
+        if cfg.control_enabled else None
+    )
 
     bridge = Bridge(cfg, loop, queue)
     try:
